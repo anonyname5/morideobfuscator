@@ -39,9 +39,12 @@ internal class YoutubeiHttpClient(
     @Volatile
     private var activeClient: ActiveClient? = null
 
-    suspend fun execute(requestJson: String): String =
+    suspend fun execute(
+        requestJson: String,
+        authentication: YoutubeiRequestAuthentication?,
+    ): String =
         try {
-            executeRequest(requestJson)
+            executeRequest(requestJson, authentication)
         } catch (exception: CancellationException) {
             throw exception
         } catch (exception: SocketTimeoutException) {
@@ -73,7 +76,10 @@ internal class YoutubeiHttpClient(
             playerSourceFailure(FailureKind.INTERNAL, "YouTube player script bridge failed")
         }
 
-    private suspend fun executeRequest(requestJson: String): String {
+    private suspend fun executeRequest(
+        requestJson: String,
+        authentication: YoutubeiRequestAuthentication?,
+    ): String {
         val parsed = JSONObject(requestJson)
         var url = parsed.getString("url").toHttpUrlOrNull()
             ?: return failure(FailureKind.INVALID_RESPONSE, "Invalid request URL")
@@ -88,7 +94,8 @@ internal class YoutubeiHttpClient(
         var redirected = false
 
         repeat(MAX_REDIRECTS + 1) { redirectCount ->
-            val request = buildRequest(url, method, headers, body)
+            val unsignedRequest = buildRequest(url, method, headers, body)
+            val request = authentication?.applyTo(unsignedRequest) ?: unsignedRequest
             val result = currentClient().newCall(request).await { value ->
                 validateUrl(value.request.url)
                 if (value.isRedirect) {

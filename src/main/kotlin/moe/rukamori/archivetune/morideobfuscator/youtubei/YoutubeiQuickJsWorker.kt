@@ -48,6 +48,7 @@ internal class YoutubeiQuickJsWorker(
 
     private var quickJs: QuickJs? = null
     private var activeVideoPoTokenProvider: (suspend (String) -> String?)? = null
+    private var activeRequestAuthentication: YoutubeiRequestAuthentication? = null
 
     suspend fun preWarm() {
         mutex.withLock {
@@ -66,6 +67,7 @@ internal class YoutubeiQuickJsWorker(
                 val runtime = ensureInitialized()
                 activeVideoPoTokenProvider = videoPoTokenProvider
                 try {
+                    activeRequestAuthentication = YoutubeiRequestAuthentication.fromRequest(JSONObject(requestJson))
                     val preparation = traceStage("prepare-player") {
                         runtime.evaluate<String>(
                             code =
@@ -107,6 +109,7 @@ internal class YoutubeiQuickJsWorker(
                     throw throwable
                 } finally {
                     activeVideoPoTokenProvider = null
+                    activeRequestAuthentication = null
                 }
             }
         }
@@ -131,7 +134,7 @@ internal class YoutubeiQuickJsWorker(
             runtime.maxStackSize = JAVASCRIPT_STACK_LIMIT_BYTES
             runtime.evaluationTimeoutMillis = JAVASCRIPT_TIMEOUT_MS
             runtime.asyncFunction<String, String>("__archiveTuneHttp") { request ->
-                httpClient.execute(request)
+                httpClient.execute(request, activeRequestAuthentication)
             }
             runtime.asyncFunction<String, String>("__archiveTunePlayerSource") { request ->
                 httpClient.executePlayerScript(request)
