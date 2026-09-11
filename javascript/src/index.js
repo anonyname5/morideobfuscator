@@ -153,7 +153,7 @@ async function getSession(request) {
     timezone: normalizedString(request.timezone) || "UTC",
     generate_session_locally: true,
     retrieve_innertube_config: false,
-    retrieve_player: true,
+    retrieve_player: authenticated,
     enable_session_cache: false,
     fetch,
   });

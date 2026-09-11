@@ -15,11 +15,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 import java.io.IOException
 import java.net.SocketTimeoutException
@@ -87,26 +87,18 @@ class YoutubeiResolver(
     ): YoutubeiResolvedStream {
         val requestJson = request.toJson().toString()
         val startedAt = SystemClock.elapsedRealtime()
-        diagnostics("Resolution started mediaId=${request.mediaId} timeoutMs=$RESOLUTION_TIMEOUT_MS")
+        diagnostics("Resolution queued mediaId=${request.mediaId}")
         val response =
             try {
-                withTimeout(RESOLUTION_TIMEOUT_MS) {
-                    worker.resolve(
-                        requestJson = requestJson,
-                        videoPoTokenProvider = videoPoTokenProvider,
-                    )
-                }
-            } catch (timeout: TimeoutCancellationException) {
-                diagnostics("Resolution timeout elapsedMs=${SystemClock.elapsedRealtime() - startedAt}")
-                throw YoutubeiException(
-                    kind = YoutubeiFailureKind.TIMEOUT,
-                    message = "youtubei.js resolution timed out",
-                    cause = timeout,
+                worker.resolve(
+                    requestJson = requestJson,
+                    videoPoTokenProvider = videoPoTokenProvider,
                 )
             } catch (cancellation: CancellationException) {
                 diagnostics("Resolution cancelled elapsedMs=${SystemClock.elapsedRealtime() - startedAt}")
                 throw cancellation
             } catch (timeout: QuickJsInterruptedException) {
+                currentCoroutineContext().ensureActive()
                 throw YoutubeiException(
                     kind = YoutubeiFailureKind.TIMEOUT,
                     message = "youtubei.js execution timed out",
@@ -118,6 +110,8 @@ class YoutubeiResolver(
                     message = timeout.message ?: "youtubei.js network request timed out",
                     cause = timeout,
                 )
+            } catch (failure: YoutubeiException) {
+                throw failure
             } catch (network: IOException) {
                 throw YoutubeiException(
                     kind = YoutubeiFailureKind.NETWORK,
@@ -125,6 +119,7 @@ class YoutubeiResolver(
                     cause = network,
                 )
             } catch (throwable: Throwable) {
+                currentCoroutineContext().ensureActive()
                 throw YoutubeiException(
                     kind = YoutubeiFailureKind.INTERNAL,
                     message = throwable.message ?: "youtubei.js execution failed",
@@ -239,7 +234,6 @@ class YoutubeiResolver(
 
     private companion object {
         const val YOUTUBEI_VERSION = "18.0.0"
-        const val RESOLUTION_TIMEOUT_MS = 35_000L
         const val DEFAULT_STREAM_LIFETIME_MS = 5L * 60L * 1000L
         val HTTP_SCHEMES = setOf("http", "https")
     }

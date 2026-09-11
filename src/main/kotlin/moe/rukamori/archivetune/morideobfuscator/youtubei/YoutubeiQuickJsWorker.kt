@@ -17,9 +17,12 @@ import com.dokar.quickjs.binding.function
 import com.dokar.quickjs.evaluate
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -51,8 +54,10 @@ internal class YoutubeiQuickJsWorker(
 
     suspend fun preWarm() {
         mutex.withLock {
-            withContext(dispatcher) {
-                ensureInitialized()
+            withResolutionTimeout {
+                withContext(dispatcher) {
+                    ensureInitialized()
+                }
             }
         }
     }
@@ -62,56 +67,85 @@ internal class YoutubeiQuickJsWorker(
         videoPoTokenProvider: suspend (String) -> String?,
     ): String =
         mutex.withLock {
-            withContext(dispatcher) {
-                val runtime = ensureInitialized()
-                activeVideoPoTokenProvider = videoPoTokenProvider
-                try {
-                    activeRequestAuthentication = YoutubeiRequestAuthentication.fromRequest(JSONObject(requestJson))
-                    val preparation = traceStage("prepare-player") {
-                        runtime.evaluate<String>(
-                            code =
-                                "await globalThis.ArchiveTuneYoutubei.prepare(" +
-                                    JSONObject.quote(requestJson) +
-                                    ");",
-                            filename = "archivetune-prepare.js",
-                        )
-                    }
-                    runtime.gc()
-                    if (!JSONObject(preparation).optBoolean("ok")) {
-                        return@withContext preparation
-                    }
-                    val response = traceStage("resolve-stream") {
-                        runtime.evaluate<String>(
-                            code =
-                                "await globalThis.ArchiveTuneYoutubei.resolvePrepared(" +
-                                    JSONObject.quote(requestJson) +
-                                    ");",
-                            filename = "archivetune-resolve.js",
-                        )
-                    }
-                    runtime.gc()
-                    response
-                } catch (throwable: Throwable) {
-                    if (
-                        throwable is CancellationException ||
-                        throwable is QuickJsInterruptedException ||
-                        throwable.isQuickJsOutOfMemory()
-                    ) {
-                        discardRuntime(runtime, throwable)
-                    } else {
-                        try {
-                            runtime.gc()
-                        } catch (gcFailure: Throwable) {
-                            throwable.addSuppressed(gcFailure)
+            withResolutionTimeout {
+                withContext(dispatcher) {
+                    val runtime = ensureInitialized()
+                    activeVideoPoTokenProvider = videoPoTokenProvider
+                    try {
+                        activeRequestAuthentication = YoutubeiRequestAuthentication.fromRequest(JSONObject(requestJson))
+                        val preparation = traceStage("prepare-player") {
+                            evaluateRequest(
+                                runtime = runtime,
+                                code =
+                                    "await globalThis.ArchiveTuneYoutubei.prepare(" +
+                                        JSONObject.quote(requestJson) +
+                                        ");",
+                                filename = "archivetune-prepare.js",
+                            )
                         }
+                        runtime.gc()
+                        if (!JSONObject(preparation).optBoolean("ok")) {
+                            return@withContext preparation
+                        }
+                        val response = traceStage("resolve-stream") {
+                            evaluateRequest(
+                                runtime = runtime,
+                                code =
+                                    "await globalThis.ArchiveTuneYoutubei.resolvePrepared(" +
+                                        JSONObject.quote(requestJson) +
+                                        ");",
+                                filename = "archivetune-resolve.js",
+                            )
+                        }
+                        runtime.gc()
+                        response
+                    } catch (throwable: Throwable) {
+                        if (
+                            throwable is CancellationException ||
+                            throwable is QuickJsInterruptedException ||
+                            throwable is YoutubeiException && throwable.kind == YoutubeiFailureKind.TIMEOUT ||
+                            throwable.isQuickJsOutOfMemory()
+                        ) {
+                            discardRuntime(runtime, throwable)
+                        } else {
+                            try {
+                                runtime.gc()
+                            } catch (gcFailure: Throwable) {
+                                throwable.addSuppressed(gcFailure)
+                            }
+                        }
+                        throw throwable
+                    } finally {
+                        activeVideoPoTokenProvider = null
+                        activeRequestAuthentication = null
                     }
-                    throw throwable
-                } finally {
-                    activeVideoPoTokenProvider = null
-                    activeRequestAuthentication = null
                 }
             }
         }
+
+    private suspend fun evaluateRequest(
+        runtime: QuickJs,
+        code: String,
+        filename: String,
+    ): String {
+        val response = runtime.evaluate<String>(code, filename)
+        currentCoroutineContext().ensureActive()
+        val error = JSONObject(response).optJSONObject("error")
+        if (error?.optString("message")?.trim().equals("interrupted", ignoreCase = true)) {
+            throw YoutubeiException(
+                kind = YoutubeiFailureKind.TIMEOUT,
+                message = "youtubei.js evaluation was interrupted",
+            )
+        }
+        return response
+    }
+
+    private suspend fun <T : Any> withResolutionTimeout(block: suspend () -> T): T =
+        withTimeoutOrNull(RESOLUTION_TIMEOUT_MS) { block() }
+            ?: throw YoutubeiException(
+                kind = YoutubeiFailureKind.TIMEOUT,
+                message = "youtubei.js resolution timed out",
+            )
 
     suspend fun closeRuntime() {
         mutex.withLock {
@@ -131,7 +165,6 @@ internal class YoutubeiQuickJsWorker(
         try {
             runtime.memoryLimit = JAVASCRIPT_MEMORY_LIMIT_BYTES
             runtime.maxStackSize = JAVASCRIPT_STACK_LIMIT_BYTES
-            runtime.evaluationTimeoutMillis = JAVASCRIPT_TIMEOUT_MS
             runtime.asyncFunction<String, String>("__archiveTuneHttp") { request ->
                 httpClient.execute(request, activeRequestAuthentication)
             }
@@ -229,7 +262,7 @@ internal class YoutubeiQuickJsWorker(
         const val YOUTUBEI_VERSION = "18.0.0"
         const val BUNDLE_ASSET = "youtubei/youtubei.bundle.js"
         const val RUNTIME_POLYFILLS_ASSET = "youtubei/runtime-polyfills.js"
-        const val JAVASCRIPT_TIMEOUT_MS = 30_000L
+        const val RESOLUTION_TIMEOUT_MS = 35_000L
         const val JAVASCRIPT_MEMORY_LIMIT_BYTES = 256L * 1024L * 1024L
         const val JAVASCRIPT_STACK_LIMIT_BYTES = 2L * 1024L * 1024L
         const val MAX_RANDOM_BYTES = 4096

@@ -12,7 +12,6 @@ import java.security.MessageDigest
 
 internal class YoutubeiRequestAuthentication private constructor(
     private val cookie: String,
-    private val userSessionId: String?,
     private val delegatedSessionId: String?,
 ) {
     private val cookies =
@@ -46,6 +45,7 @@ internal class YoutubeiRequestAuthentication private constructor(
             .header("Authorization", authorization)
             .header("Origin", origin)
             .header("X-Origin", origin)
+            .header("X-Goog-AuthUser", "0")
             .header("X-Youtube-Bootstrap-Logged-In", "true")
             .apply {
                 if (delegatedSessionId != null) {
@@ -64,12 +64,11 @@ internal class YoutubeiRequestAuthentication private constructor(
         timestamp: Long,
     ): String? {
         if (sid == null) return null
-        val input = listOfNotNull(userSessionId, timestamp.toString(), sid, origin).joinToString(" ")
+        val input = "$timestamp $sid $origin"
         val hash = MessageDigest.getInstance("SHA-1")
             .digest(input.toByteArray(Charsets.UTF_8))
             .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
-        val suffix = if (userSessionId == null) "" else "_u"
-        return "$scheme ${timestamp}_$hash$suffix"
+        return "$scheme ${timestamp}_$hash"
     }
 
     companion object {
@@ -83,7 +82,6 @@ internal class YoutubeiRequestAuthentication private constructor(
             val second = dataSyncId?.substringAfter("||", "")?.trim()?.takeIf(String::isNotEmpty)
             return YoutubeiRequestAuthentication(
                 cookie = cookie,
-                userSessionId = second ?: first,
                 delegatedSessionId = first.takeIf { second != null },
             )
         }
