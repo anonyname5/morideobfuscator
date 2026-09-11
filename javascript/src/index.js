@@ -1,4 +1,4 @@
-import Innertube, { ClientType, Constants, Platform } from "youtubei.js/web.bundle";
+import Innertube, { ClientType, Constants, Platform, Player } from "youtubei.js/web.bundle";
 import {
   CustomEvent,
   File,
@@ -24,6 +24,7 @@ const SUPPORTED_AUDIO_MIME_TYPES = new Set([
 ]);
 const ANONYMOUS_CLIENT = "VISIONOS";
 const AUTHENTICATED_CLIENT = "WEB_CREATOR";
+const AUTHENTICATED_CLIENT_VERSION = "1.20260708.06.00";
 const CATALOG_DURATION_TOLERANCE_SECONDS = 2;
 const MAX_CATALOG_REPLACEMENT_CANDIDATES = 5;
 const AUTH_COOKIE_NAMES = ["SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"];
@@ -41,6 +42,7 @@ const FAILURE_KINDS = new Set([
 ]);
 
 installWebPlatform();
+Constants.CLIENTS.WEB_CREATOR.VERSION = AUTHENTICATED_CLIENT_VERSION;
 
 class AndroidCache {
   get cache_dir() {
@@ -153,7 +155,7 @@ async function getSession(request) {
     timezone: normalizedString(request.timezone) || "UTC",
     generate_session_locally: true,
     retrieve_innertube_config: false,
-    retrieve_player: authenticated,
+    retrieve_player: false,
     enable_session_cache: false,
     fetch,
   });
@@ -233,6 +235,24 @@ function selectedFormat(formats, request) {
   const original = sorted.filter((format) => format.is_original);
   const primary = original.length ? original : sorted;
   return preferredFormat(primary, request);
+}
+
+function formatNeedsPlayer(format) {
+  if (format.signature_cipher || format.cipher) return true;
+  const url = normalizedString(format.url);
+  if (!url) return false;
+  return new URL(url).searchParams.has("n");
+}
+
+async function getPlayer(youtube) {
+  if (youtube.session.player) return youtube.session.player;
+  const player = await Player.create(
+    new AndroidCache(),
+    fetch,
+    youtube.session.po_token,
+  );
+  youtube.session.player = player;
+  return player;
 }
 
 function extractExpiry(url, streamingDataExpiry) {
@@ -495,9 +515,18 @@ async function resolveWithClient(youtube, request, client, preparedInfo) {
   }
 
   const format = selectedFormat(formats, request);
+  let player;
+  try {
+    player = formatNeedsPlayer(format) ? await getPlayer(youtube) : undefined;
+  } catch (cause) {
+    if (failureKind(cause) !== "INTERNAL") throw cause;
+    const error = new Error(failureMessage(cause, "youtubei.js could not prepare URL deciphering"));
+    error.kind = "DECIPHER";
+    throw error;
+  }
   let url;
   try {
-    url = await format.decipher(youtube.session.player);
+    url = await format.decipher(player);
   } catch (cause) {
     const error = new Error(failureMessage(cause, "youtubei.js could not decipher the audio URL"));
     error.kind = "DECIPHER";
