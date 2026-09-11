@@ -1,4 +1,13 @@
-import Innertube, { ClientType, Constants, Platform, Player } from "youtubei.js/web.bundle";
+import Innertube, {
+  ClientType,
+  Constants,
+  JsAnalyzer,
+  JsExtractor,
+  JsMatchers,
+  Platform,
+  Player,
+  Utils,
+} from "youtubei.js/web.bundle";
 import {
   CustomEvent,
   File,
@@ -91,6 +100,8 @@ let session;
 let sessionIdentity;
 let catalogSession;
 let catalogSessionIdentity;
+let stagedPlayerId;
+let stagedPlayerSource;
 
 function normalizedString(value) {
   const normalized = typeof value === "string" ? value.trim() : "";
@@ -160,6 +171,8 @@ async function getSession(request) {
     fetch,
   });
   sessionIdentity = identity;
+  stagedPlayerId = undefined;
+  stagedPlayerSource = undefined;
   return session;
 }
 
@@ -244,15 +257,127 @@ function formatNeedsPlayer(format) {
   return new URL(url).searchParams.has("n");
 }
 
-async function getPlayer(youtube) {
-  if (youtube.session.player) return youtube.session.player;
-  const player = await Player.create(
-    new AndroidCache(),
-    fetch,
-    youtube.session.po_token,
+function playerError(message, kind, httpStatus) {
+  const error = new Error(message);
+  error.kind = kind;
+  if (httpStatus) error.httpStatus = httpStatus;
+  return error;
+}
+
+async function getCurrentPlayerId() {
+  const response = await fetch(new URL("/iframe_api", Constants.URLS.YT_BASE));
+  if (!response.ok) {
+    throw playerError(
+      `youtubei.js player ID request failed with HTTP ${response.status}`,
+      "HTTP",
+      response.status,
+    );
+  }
+  const source = await response.text();
+  const playerId = /player\\\/([A-Za-z0-9._-]+)\\\//.exec(source)?.[1];
+  if (!playerId) {
+    throw playerError("youtubei.js could not extract the current player ID", "DECIPHER");
+  }
+  return playerId;
+}
+
+async function downloadPlayerSource(playerId) {
+  const url = new URL(
+    `/s/player/${playerId}/player_es6.vflset/en_US/base.js`,
+    Constants.URLS.YT_BASE,
   );
+  const response = await fetch(url, {
+    headers: {
+      "user-agent": Utils.getRandomUserAgent("desktop"),
+    },
+  });
+  if (!response.ok) {
+    throw playerError(
+      `youtubei.js player script request failed with HTTP ${response.status}`,
+      "HTTP",
+      response.status,
+    );
+  }
+  const source = await response.text();
+  if (!source) {
+    throw playerError("youtubei.js returned an empty player script", "INVALID_RESPONSE");
+  }
+  return source;
+}
+
+function extractSignatureTimestamp(source) {
+  const values = new Set(
+    [...source.matchAll(/signatureTimestamp\s*:\s*(\d{5,})/g)].map((match) => match[1]),
+  );
+  if (values.size !== 1) {
+    throw playerError("youtubei.js could not extract the player signature timestamp", "DECIPHER");
+  }
+  const timestamp = Number(values.values().next().value);
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
+    throw playerError("youtubei.js returned an invalid player signature timestamp", "DECIPHER");
+  }
+  return timestamp;
+}
+
+function extractPlayerData(source) {
+  const functionName = "nsigFunction";
+  const analyzer = new JsAnalyzer(source, {
+    extractions: [{ friendlyName: functionName, match: JsMatchers.nsigMatcher }],
+  });
+  const data = new JsExtractor(analyzer).buildScript({
+    disallowSideEffectInitializers: true,
+  });
+  if (!data.exported.includes(functionName)) {
+    throw playerError("youtubei.js could not extract the player decipher function", "DECIPHER");
+  }
+  return data;
+}
+
+async function ensurePlayerMetadata(youtube) {
+  const existing = youtube.session.player;
+  if (Number(existing?.signature_timestamp) > 0) return existing;
+
+  const playerId = await getCurrentPlayerId();
+  const cache = new AndroidCache();
+  const cached = await Player.fromCache(cache, playerId);
+  if (Number(cached?.signature_timestamp) > 0 && cached.data) {
+    cached.po_token = youtube.session.po_token;
+    youtube.session.player = cached;
+    stagedPlayerId = undefined;
+    stagedPlayerSource = undefined;
+    return cached;
+  }
+  if (cached) await cache.remove(playerId);
+
+  const source = await downloadPlayerSource(playerId);
+  const player = new Player(playerId, extractSignatureTimestamp(source));
+  player.po_token = youtube.session.po_token;
   youtube.session.player = player;
+  stagedPlayerId = playerId;
+  stagedPlayerSource = source;
   return player;
+}
+
+async function getPlayer(youtube) {
+  const metadata = await ensurePlayerMetadata(youtube);
+  if (metadata.data) return metadata;
+
+  const source = stagedPlayerId === metadata.player_id && stagedPlayerSource
+    ? stagedPlayerSource
+    : await downloadPlayerSource(metadata.player_id);
+  try {
+    const player = await Player.fromSource(metadata.player_id, {
+      cache: new AndroidCache(),
+      signature_timestamp: metadata.signature_timestamp,
+      data: extractPlayerData(source),
+    });
+    player.po_token = youtube.session.po_token;
+    youtube.session.player = player;
+    return player;
+  } finally {
+    stagedPlayerId = undefined;
+    stagedPlayerSource = undefined;
+  }
 }
 
 function extractExpiry(url, streamingDataExpiry) {
@@ -492,6 +617,7 @@ async function resolveCatalogReplacement(youtube, request, sourceInfo) {
 
 async function resolveWithClient(youtube, request, client, preparedInfo) {
   const supportsGvsPoToken = client === AUTHENTICATED_CLIENT;
+  if (supportsGvsPoToken && !preparedInfo) await ensurePlayerMetadata(youtube);
   const info = preparedInfo ||
     await youtube.getBasicInfo(request.mediaId, {
       client,
@@ -622,6 +748,9 @@ async function resolvePrepared(requestJson) {
       ok: false,
       error: normalizedFailure(error),
     });
+  } finally {
+    stagedPlayerId = undefined;
+    stagedPlayerSource = undefined;
   }
 }
 
@@ -634,5 +763,7 @@ globalThis.ArchiveTuneYoutubei = Object.freeze({
     sessionIdentity = undefined;
     catalogSession = undefined;
     catalogSessionIdentity = undefined;
+    stagedPlayerId = undefined;
+    stagedPlayerSource = undefined;
   },
 });
