@@ -39,7 +39,12 @@ internal class YoutubeiQuickJsWorker(
     private val dispatcher =
         Executors
             .newSingleThreadExecutor { runnable ->
-                Thread(runnable, "ArchiveTune-Youtubei-$name").apply { isDaemon = true }
+                Thread(
+                    null,
+                    runnable,
+                    "ArchiveTune-Youtubei-$name",
+                    WORKER_STACK_SIZE_BYTES,
+                ).apply { isDaemon = true }
             }.asCoroutineDispatcher()
     private val mutex = Mutex()
     private val secureRandom = SecureRandom()
@@ -252,6 +257,7 @@ internal class YoutubeiQuickJsWorker(
         const val RUNTIME_POLYFILLS_ASSET = "youtubei/runtime-polyfills.js"
         const val JAVASCRIPT_MEMORY_LIMIT_BYTES = 256L * 1024L * 1024L
         const val JAVASCRIPT_STACK_LIMIT_BYTES = 2L * 1024L * 1024L
+        const val WORKER_STACK_SIZE_BYTES = 4L * JAVASCRIPT_STACK_LIMIT_BYTES
         const val MAX_RANDOM_BYTES = 4096
     }
 }
